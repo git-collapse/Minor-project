@@ -34,6 +34,7 @@ class SimulationRequest(BaseModel):
     lr: float = 0.06
 
 @app.get("/api/devices")
+@app.get("/devices")
 def get_devices(n_devices: int = 10, straggler_pct: int = 30, w1: float = 0.5, w2: float = 0.5, selection_ratio: int = 60):
     sim = SimulationManager(
         n_devices_per_cluster=n_devices,
@@ -72,6 +73,7 @@ def get_devices(n_devices: int = 10, straggler_pct: int = 30, w1: float = 0.5, w
     return {"devices": devices}
 
 @app.post("/api/run-simulation")
+@app.post("/run-simulation")
 def run_simulation(req: SimulationRequest):
     sim = SimulationManager(
         n_devices_per_cluster=req.n_devices_per_cluster,
@@ -110,6 +112,7 @@ def run_simulation(req: SimulationRequest):
     return {"history": rounds_out}
 
 @app.post("/api/run-benchmark")
+@app.post("/run-benchmark")
 def run_benchmark(req: SimulationRequest):
     sim = SimulationManager(
         n_devices_per_cluster=req.n_devices_per_cluster,
@@ -164,6 +167,11 @@ def run_benchmark(req: SimulationRequest):
 
 
 @app.get("/", response_class=HTMLResponse)
+@app.get("/api", response_class=HTMLResponse)
+@app.get("/api/", response_class=HTMLResponse)
+@app.get("/api/index", response_class=HTMLResponse)
+@app.get("/api/index.py", response_class=HTMLResponse)
+@app.get("/index", response_class=HTMLResponse)
 def index_page():
     """Serves the complete interactive dashboard on Vercel."""
     html_content = """<!DOCTYPE html>
@@ -616,3 +624,12 @@ def index_page():
 </body>
 </html>"""
     return HTMLResponse(content=html_content)
+
+@app.exception_handler(404)
+async def custom_404_handler(request: Request, exc):
+    """Fallback handler to prevent 'detail: Not Found' errors on Vercel."""
+    path = request.url.path
+    if path.startswith("/api/run-") or path.startswith("/run-") or path.startswith("/api/devices"):
+        return JSONResponse(status_code=404, content={"detail": f"API endpoint not found: {path}"})
+    return index_page()
+
