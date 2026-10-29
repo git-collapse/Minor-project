@@ -1,8 +1,9 @@
 import os
 import sys
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # Ensure parent directory is on sys.path for importing src and data
@@ -19,11 +20,34 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Enable CORS for all origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Vercel ASGI Middleware: Restores original request path if rewritten to /api/index.py
+@app.middleware("http")
+async def vercel_path_rewrite_middleware(request: Request, call_next):
+    original_path = (
+        request.headers.get("x-matched-path")
+        or request.headers.get("x-forwarded-uri")
+        or request.headers.get("x-original-uri")
+        or request.headers.get("x-rewrite-url")
+    )
+    if original_path and original_path not in ("/api/index.py", "/api/index"):
+        request.scope["path"] = original_path.split("?")[0]
+    return await call_next(request)
+
 # Also alias handler for Vercel WSGI/ASGI compatibility
 handler = app
 application = app
 
 class SimulationRequest(BaseModel):
+    action: Optional[str] = None
     n_devices_per_cluster: int = 10
     straggler_pct: int = 30
     selection_ratio: int = 60
@@ -165,6 +189,52 @@ def run_benchmark(req: SimulationRequest):
 
     return {"benchmark_series": results, "table": table_rows}
 
+# ==========================================
+# UNIVERSAL ACTION DISPATCHER FOR VERCEL
+# Handles any POST / GET rewritten to /api/index.py or root
+# ==========================================
+@app.post("/")
+@app.post("/api")
+@app.post("/api/")
+@app.post("/api/index")
+@app.post("/api/index.py")
+async def universal_post_dispatch(request: Request):
+    query = request.query_params
+    action = query.get("action", "")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if not action:
+        action = body.get("action", "")
+
+    req_obj = SimulationRequest(
+        action=action,
+        n_devices_per_cluster=int(body.get("n_devices_per_cluster", 10)),
+        straggler_pct=int(body.get("straggler_pct", 30)),
+        selection_ratio=int(body.get("selection_ratio", 60)),
+        w1=float(body.get("w1", 0.5)),
+        w2=float(body.get("w2", 0.5)),
+        n_rounds=int(body.get("n_rounds", 12)),
+        epochs=int(body.get("epochs", 2)),
+        lr=float(body.get("lr", 0.06))
+    )
+
+    if action == "benchmark":
+        return run_benchmark(req_obj)
+    elif action == "devices":
+        return get_devices(
+            n_devices=req_obj.n_devices_per_cluster,
+            straggler_pct=req_obj.straggler_pct,
+            w1=req_obj.w1,
+            w2=req_obj.w2,
+            selection_ratio=req_obj.selection_ratio
+        )
+    else:
+        return run_simulation(req_obj)
+
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/api", response_class=HTMLResponse)
@@ -172,8 +242,18 @@ def run_benchmark(req: SimulationRequest):
 @app.get("/api/index", response_class=HTMLResponse)
 @app.get("/api/index.py", response_class=HTMLResponse)
 @app.get("/index", response_class=HTMLResponse)
-def index_page():
+def index_page(request: Request):
     """Serves the complete interactive dashboard on Vercel."""
+    # Check if a device query was sent via GET
+    action = request.query_params.get("action", "")
+    if action == "devices":
+        n_dev = int(request.query_params.get("n_devices", 10))
+        strag = int(request.query_params.get("straggler_pct", 30))
+        w1_v = float(request.query_params.get("w1", 0.5))
+        w2_v = float(request.query_params.get("w2", 0.5))
+        sel = int(request.query_params.get("selection_ratio", 60))
+        return JSONResponse(content=get_devices(n_devices=n_dev, straggler_pct=strag, w1=w1_v, w2=w2_v, selection_ratio=sel))
+
     html_content = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -427,6 +507,7 @@ def index_page():
             btn.innerText = "⏳ Simulating...";
 
             const payload = {
+                action: "simulation",
                 n_devices_per_cluster: parseInt(document.getElementById('inp_devices').value),
                 straggler_pct: parseInt(document.getElementById('inp_stragglers').value),
                 selection_ratio: parseInt(document.getElementById('inp_selection').value),
@@ -438,15 +519,24 @@ def index_page():
             };
 
             try {
-                const res = await fetch('/api/run-simulation', {
+                // Try direct endpoint with action query fallback
+                const res = await fetch('/api/run-simulation?action=simulation', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify(payload)
                 });
+                if (!res.ok) {
+                    const errText = await res.text();
+                    throw new Error(`Server returned HTTP ${res.status}: ${errText.slice(0, 150)}`);
+                }
                 const data = await res.json();
+                if (!data || !data.history) {
+                    throw new Error("Invalid response format from server: " + JSON.stringify(data).slice(0, 150));
+                }
                 renderLiveCharts(data.history);
             } catch (err) {
-                alert("Simulation failed: " + err);
+                console.error("Simulation error:", err);
+                alert("Simulation failed: " + err.message);
             } finally {
                 btn.disabled = false;
                 btn.innerText = "▶️ Run Simulation";
@@ -454,6 +544,8 @@ def index_page():
         }
 
         function renderLiveCharts(history) {
+            if (!history || !Array.isArray(history) || history.length === 0) return;
+
             const rounds = history.map(h => 'R' + h.round);
             const accs = history.map(h => h.accuracy);
             const losses = history.map(h => h.loss);
@@ -478,9 +570,9 @@ def index_page():
                     labels: rounds,
                     datasets: [
                         { label: 'Global Accuracy (%)', data: accs, borderColor: '#2563EB', backgroundColor: '#2563EB', borderWidth: 2.5, tension: 0.2 },
-                        { label: 'Smart City', data: history.map(h => h.domains['Smart City']), borderColor: '#059669', borderDash: [4,4], borderWidth: 1.5, tension: 0.2 },
-                        { label: 'Healthcare', data: history.map(h => h.domains['Mobile Healthcare']), borderColor: '#DC2626', borderDash: [4,4], borderWidth: 1.5, tension: 0.2 },
-                        { label: 'Agriculture', data: history.map(h => h.domains['Agriculture']), borderColor: '#D97706', borderDash: [4,4], borderWidth: 1.5, tension: 0.2 }
+                        { label: 'Smart City', data: history.map(h => h.domains ? h.domains['Smart City'] : 0), borderColor: '#059669', borderDash: [4,4], borderWidth: 1.5, tension: 0.2 },
+                        { label: 'Healthcare', data: history.map(h => h.domains ? h.domains['Mobile Healthcare'] : 0), borderColor: '#DC2626', borderDash: [4,4], borderWidth: 1.5, tension: 0.2 },
+                        { label: 'Agriculture', data: history.map(h => h.domains ? h.domains['Agriculture'] : 0), borderColor: '#D97706', borderDash: [4,4], borderWidth: 1.5, tension: 0.2 }
                     ]
                 },
                 options: { responsive: true, maintainAspectRatio: false }
@@ -514,38 +606,44 @@ def index_page():
             const w1 = document.getElementById('inp_w1').value;
             const sel = document.getElementById('inp_selection').value;
 
-            const res = await fetch(`/api/devices?n_devices=${devCount}&straggler_pct=${straggler}&w1=${w1}&w2=${1-w1}&selection_ratio=${sel}`);
-            const data = await res.json();
+            try {
+                const res = await fetch(`/api/devices?action=devices&n_devices=${devCount}&straggler_pct=${straggler}&w1=${w1}&w2=${1-w1}&selection_ratio=${sel}`);
+                if (!res.ok) return;
+                const data = await res.json();
+                if (!data || !data.devices) return;
 
-            const grid = document.getElementById('topo_grid');
-            grid.innerHTML = '';
+                const grid = document.getElementById('topo_grid');
+                grid.innerHTML = '';
 
-            const clusters = {};
-            data.devices.forEach(d => {
-                if (!clusters[d.domain]) clusters[d.domain] = [];
-                clusters[d.domain].push(d);
-            });
+                const clusters = {};
+                data.devices.forEach(d => {
+                    if (!clusters[d.domain]) clusters[d.domain] = [];
+                    clusters[d.domain].push(d);
+                });
 
-            for (const [domain, devs] of Object.entries(clusters)) {
-                let devBadges = devs.map(d => {
-                    let col = d.is_straggler ? 'bg-red-100 text-red-800 border-red-300' : (d.battery_pct < 30 ? 'bg-amber-100 text-amber-800 border-amber-300' : 'bg-emerald-100 text-emerald-800 border-emerald-300');
-                    return `<div class="p-2 rounded border ${col} text-[11px] mb-1.5 flex justify-between items-center">
-                        <div>
-                            <b>${d.device_id}</b> (${d.cpu_ghz} GHz, ${d.latency_ms}ms)
+                for (const [domain, devs] of Object.entries(clusters)) {
+                    let devBadges = devs.map(d => {
+                        let col = d.is_straggler ? 'bg-red-100 text-red-800 border-red-300' : (d.battery_pct < 30 ? 'bg-amber-100 text-amber-800 border-amber-300' : 'bg-emerald-100 text-emerald-800 border-emerald-300');
+                        return `<div class="p-2 rounded border ${col} text-[11px] mb-1.5 flex justify-between items-center">
+                            <div>
+                                <b>${d.device_id}</b> (${d.cpu_ghz} GHz, ${d.latency_ms}ms)
+                            </div>
+                            <div class="font-bold">Q: ${d.q_score}</div>
+                        </div>`;
+                    }).join('');
+
+                    grid.innerHTML += `
+                        <div class="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                            <div class="font-bold text-sm text-slate-800 mb-2 flex items-center justify-between">
+                                <span>📡 ${domain}</span>
+                                <span class="text-xs font-normal text-slate-500">Edge Head</span>
+                            </div>
+                            <div class="max-h-72 overflow-y-auto space-y-1 pr-1">${devBadges}</div>
                         </div>
-                        <div class="font-bold">Q: ${d.q_score}</div>
-                    </div>`;
-                }).join('');
-
-                grid.innerHTML += `
-                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-4">
-                        <div class="font-bold text-sm text-slate-800 mb-2 flex items-center justify-between">
-                            <span>📡 ${domain}</span>
-                            <span class="text-xs font-normal text-slate-500">Edge Head</span>
-                        </div>
-                        <div class="max-h-72 overflow-y-auto space-y-1 pr-1">${devBadges}</div>
-                    </div>
-                `;
+                    `;
+                }
+            } catch (err) {
+                console.error("Failed to refresh topology:", err);
             }
         }
 
@@ -556,6 +654,7 @@ def index_page():
             btn.innerText = "⏳ Benchmarking...";
 
             const payload = {
+                action: "benchmark",
                 n_devices_per_cluster: parseInt(document.getElementById('inp_devices').value),
                 straggler_pct: parseInt(document.getElementById('inp_stragglers').value),
                 selection_ratio: parseInt(document.getElementById('inp_selection').value),
@@ -567,12 +666,19 @@ def index_page():
             };
 
             try {
-                const res = await fetch('/api/run-benchmark', {
+                const res = await fetch('/api/run-benchmark?action=benchmark', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify(payload)
                 });
+                if (!res.ok) {
+                    const errText = await res.text();
+                    throw new Error(`Server returned HTTP ${res.status}: ${errText.slice(0, 150)}`);
+                }
                 const data = await res.json();
+                if (!data || !data.table) {
+                    throw new Error("Invalid benchmark response format");
+                }
 
                 // Populate Table
                 const tbody = document.getElementById('bench_tbody');
@@ -610,7 +716,8 @@ def index_page():
                 });
 
             } catch (err) {
-                alert("Benchmark failed: " + err);
+                console.error("Benchmark error:", err);
+                alert("Benchmark failed: " + err.message);
             } finally {
                 btn.disabled = false;
                 btn.innerText = "📊 Compare Baselines";
@@ -627,9 +734,8 @@ def index_page():
 
 @app.exception_handler(404)
 async def custom_404_handler(request: Request, exc):
-    """Fallback handler to prevent 'detail: Not Found' errors on Vercel."""
+    """Fallback handler to prevent 404 errors on Vercel rewrites."""
     path = request.url.path
-    if path.startswith("/api/run-") or path.startswith("/run-") or path.startswith("/api/devices"):
+    if path.startswith("/api/run-") or path.startswith("/run-"):
         return JSONResponse(status_code=404, content={"detail": f"API endpoint not found: {path}"})
-    return index_page()
-
+    return index_page(request)
