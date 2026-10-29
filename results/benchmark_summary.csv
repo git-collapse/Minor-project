@@ -1,0 +1,4 @@
+Algorithm,Accuracy (%),Precision (%),Recall (%),F1-Score (%),Final Loss,Avg Time/Round (s),Total Energy (J)
+MEC-AI HetFL (Proposed),73.67,62.19,80.35,70.11,0.5353,1.58,216.13
+EdgeFed (Hierarchical Baseline),74.78,65.22,73.7,69.2,0.511,6.27,480.26
+FedAvg (Sync Straggler Bottleneck),75.56,65.29,77.75,70.98,0.5159,6.45,819.29
